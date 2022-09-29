@@ -1,0 +1,272 @@
+/*----------------------------------------------------------------------------
+    Given code for Embedded Systems Lab 5 
+    
+    This project illustrates the use of 
+      - threads
+      - event flags
+      - a message queue
+    The behaviour is: 
+        - the green LED can be turned on or off using command entered on a terminal 
+          emulator (see lab sheet) and send over the USB link
+        - if the command are entered in the wrong order, the system enters an
+          error state: the red LED flashes
+        - to exit from the error state the 'reset' command must be entered
+        - the system is initialised in the error state
+        
+    There are three threads
+       t_serial: waits for input from the terminal; sends message to t_greenLED
+       t_greenLED: turns the green LED on and off on receipt of the message. Enters
+         an error state when the message is not appropriate
+       t_redLED: flashes the red on and off when an error state is signalled by the
+         t_greenLED
+    
+    Message queue: 
+       * Message are put in the queue t_serial
+       * Messages are read from the queue by t_greenLED
+    Signal using event flags
+       * A flag is set by t_greenLED
+       * The thread t_redLED waits on the flag
+ *---------------------------------------------------------------------------*/
+ 
+#include "cmsis_os2.h"
+#include "string.h"
+
+#include <MKL25Z4.h>
+#include <stdbool.h>
+#include "gpio.h"
+#include "serialPort.h"
+
+#define RESET_EVT (1)
+osEventFlagsId_t errorFlags ;       // id of the event flags
+osMessageQueueId_t controlMsgQ ;    // id for the message queue
+
+
+/*--------------------------------------------------------------
+ *   Thread t_redLED
+ *       Flash Red LED to show an error
+ *       States are: ERRORON, ERROROFF and NOERROR
+ *       A signal is set to change the error status
+ *          - LED off when no error
+ *          - LED flashes when there is an error
+ *--------------------------------------------------------------*/
+
+osThreadId_t t_redLED;        /* id of thread to flash red led */
+
+// Red LED states
+#define ERRORON (0)
+#define ERROROFF (1)
+#define NOERROR (2)
+#define ERRORFLASH (400)
+
+void redLEDThread (void *arg) {
+    int redState = ERRORON ;
+    redLEDOnOff(LED_ON);
+    uint32_t flags ;                // returned by osEventFlagWait
+    uint32_t delay = ERRORFLASH ;   // delay used in the wait - varies
+
+    while (1) {
+        // wait for a signal or timeout
+        flags = osEventFlagsWait (errorFlags, MASK(RESET_EVT), osFlagsWaitAny, delay);
+        
+        // interpret state machine
+        switch (redState) {
+            case ERRORON:   // error state - flashing, currently on
+                redLEDOnOff(LED_OFF);
+                if (flags == osFlagsErrorTimeout) {  // timeout continue flashing           
+                    redState = ERROROFF ;
+                } else {                             // signal - move to no error state
+                    redState = NOERROR ;
+                    delay = osWaitForever ;
+                }
+                break ;
+
+            case ERROROFF:   // error state - flashing, currently off
+                if (flags == osFlagsErrorTimeout) {  // timeout continue flashing
+                    redLEDOnOff(LED_ON);
+                    redState = ERRORON ;
+                } else {                             // signal - move to no error state
+                    redState = NOERROR ;
+                    delay = osWaitForever ;
+                }
+                break ;
+                
+            case NOERROR:                            // no error - react on signal
+                delay = ERRORFLASH ;
+                redState = ERRORON ;
+                redLEDOnOff(LED_ON) ;            
+                break ;
+        }
+    }
+}
+
+/*--------------------------------------------------------------
+ *   Thread t_redgreenLED
+ *      Set the green and red on and off on receipt of message
+ *      Messages: faster and slower (uses an enum)
+ *      Acceptable message
+ *         - in greenon state expect faster or slower message
+ *         - in redon state expect faster or slower message
+ *--------------------------------------------------------------*/
+
+
+osThreadId_t t_redgreenLED;      /* id of thread to toggle green led */
+
+// Green LED states
+#define GREENON (0)//turn green on and red led off
+#define REDON (1)//turn red on and green led off
+
+enum controlMsg_t {faster, slower} ;  // type for the messages either faster and slower delay
+
+
+
+void redgreenLEDThread (void *arg) {
+		int speed [9]={500,1000,1500,2000,2500,3000,3500,4000};// many different time delays array
+    int ledState = GREENON ;//intial led on 
+	  int pos=0;//position integer of the array
+    int delay;
+		delay=speed[pos];//counter delay value assignment
+		int newDelay;//
+    enum controlMsg_t msg ;//recieved the message from the terminal
+    osStatus_t status ;   // returned by message queue get
+    while (1) {
+        // wait for message from queue
+			
+				//tick1
+			uint32_t time_check1= osKernelGetTickCount();//1st tick value
+			status = osMessageQueueGet(controlMsgQ, &msg, NULL, delay);//message queue for checking status
+			uint32_t time_check2=  osKernelGetTickCount()-time_check1;//1st tick minus 2nd tick time waited
+			//tick
+			
+				if (status == osOK) //check OS status
+					{
+					if (msg == faster) //check if message is faster
+						{           // expected message                   
+							pos--;// move the counter to a lesser value
+							delay=speed[pos];		
+							if(pos<0)//when position of the array is less than 0
+								{
+								pos=7;//it then goes to position 7 of the array
+								}
+							newDelay=speed[pos]-time_check2;//newDelay integer assigned with counter value minus the time waited value of the function osMessageQueueGet
+							if (newDelay>=0)// when the newDelay integer is greater or equals to zero
+								{
+								delay=newDelay;//the counter delay integer is set to the newDelay integer which is counter minus time waited value
+								}
+							else
+								{
+								delay=0;// change delay integer counter to 0 so it would switch state immediately
+								}
+						}
+					if (msg == slower)//check message is slower
+						{
+							pos++;//increase array value to increase counter
+							delay=speed[pos];		
+							if(pos>7)
+								{
+								pos=0;
+								}
+							newDelay=speed[pos]-time_check2;
+							if (newDelay>=0)//if waited value greater than 0
+								{
+								delay=newDelay;//set the counter value to the waited value
+								}
+							else
+								{
+								delay=0;//change state as the counter will end
+								}
+						}      
+					}		
+				delay=speed[pos];				//set the couunter delay value from the array
+			if (status==osErrorTimeout)//counter has ended as os Error flag checks out as with status
+				{
+					
+            switch (ledState) {
+                case GREENON://green led on only so red led off
+									greenLEDOnOff(LED_ON);
+									redLEDOnOff(LED_OFF);
+								  ledState=REDON;//next led state
+                  break ;
+                    
+                case REDON: //red led on green led off state
+										greenLEDOnOff(LED_OFF);
+										redLEDOnOff(LED_ON);
+										ledState=GREENON;//next led state
+										break;
+						}
+				}
+        
+			}
+		}
+/*------------------------------------------------------------
+ *  Thread t_command
+ *      Request user command
+ *      
+ *
+ *------------------------------------------------------------*/
+osThreadId_t t_command;        /* id of thread to receive command */
+
+/* const */ char prompt[] = "Command: faster / slower>" ;
+/* const */ char empty[] = "" ;
+
+void commandThread (void *arg) {
+    char response[6] ;  // buffer for response string
+    enum controlMsg_t msg ;
+    bool valid ;
+    while (1) {
+        //sendMsg(empty, CRLF) ;
+        sendMsg(prompt, NOLINE) ;
+        readLine(response, 6) ;  // 
+        valid = true ;
+        if (strcmp(response, "faster") == 0) {//expected message faster
+            msg = faster ;//message string check
+        } else if (strcmp(response, "slower") == 0) {//expected message slower
+            msg = slower ;
+        } 
+        
+        if (valid) {
+            osMessageQueuePut(controlMsgQ, &msg, 0, NULL);  // Send Message
+        } else {
+            sendMsg(response, NOLINE) ;
+            sendMsg(" not recognised", CRLF) ;
+        }
+    }
+}
+
+/*----------------------------------------------------------------------------
+ * Application main
+ *   Initialise I/O
+ *   Initialise kernel
+ *   Create threads
+ *   Start kernel
+ *---------------------------------------------------------------------------*/
+
+int main (void) { 
+    
+    // System Initialization
+    SystemCoreClockUpdate();
+
+    // Initialise peripherals
+    configureGPIOoutput();
+    //configureGPIOinput();
+    init_UART0(115200) ;
+
+    // Initialize CMSIS-RTOS
+    osKernelInitialize();
+    
+    // Create event flags
+    errorFlags = osEventFlagsNew(NULL);
+    
+    // create message queue
+    controlMsgQ = osMessageQueueNew(2, sizeof(enum controlMsg_t), NULL) ;
+
+    // initialise serial port 
+    initSerialPort() ;
+ 
+    // Create threads
+
+    t_redgreenLED = osThreadNew(redgreenLEDThread, NULL, NULL);// thread id and method for checking the timer
+    t_command = osThreadNew(commandThread, NULL, NULL); //command thread for recieving a new message
+    
+    osKernelStart();    // Start thread execution - DOES NOT RETURN
+    for (;;) {}         // Only executed when an error occurs
+}
